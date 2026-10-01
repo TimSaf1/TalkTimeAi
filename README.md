@@ -5,6 +5,30 @@
 (карточка персонажа сбоку, пузыри диалога, «печатание» ответа, быстрые
 подсказки).
 
+## Публикация на GitHub
+
+Код уже закоммичен в ветке. Чтобы опубликовать репозиторий:
+
+1. Создайте пустой публичный репозиторий на GitHub (например, `amy-chat`).
+2. Выполните в папке проекта:
+
+```bash
+git remote add origin https://github.com/<ВАШ_ЛОГИН>/amy-chat.git
+git branch -M main
+git push -u origin main
+```
+
+Альтернатива через GitHub CLI (нужен авторизованный `gh`):
+
+```bash
+gh auth login
+gh repo create amy-chat --public --source=. --push
+```
+
+> ⚠️ Для push нужны ваши credentials (токен с правом `repo` или SSH-ключ).
+> В текущем окружении токена GitHub нет, поэтому push нужно выполнить
+> на своей машине либо предоставить токен (`GITHUB_TOKEN`).
+
 ## Откуда модель
 
 «Мозг» Эми — модель из Hugging Face Space
