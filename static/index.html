@@ -274,7 +274,8 @@ async function send() {
     const d = await api('/api/chat', { message: text, session_id: sessionId });
     sessionId = d.session_id;
     typingOff();
-    typeOut(d.reply, sourceLabel(d));
+    if (d.source === 'warming') { pollStatus(); addMessage('assistant', d.reply); }
+    else typeOut(d.reply, sourceLabel(d));
   } catch (e) {
     typingOff();
     addMessage('assistant', 'Что-то пошло не так: модель не ответила. Попробуйте ещё раз.');
@@ -283,8 +284,8 @@ async function send() {
 }
 
 function sourceLabel(d) {
-  const src = {'model':'сгенерировано моделью','guard':'guard-личность','offline':'guard (модель недоступна)'}[d.source] || d.source;
-  const mode = {'dolphin':'Dolphin 3.0 (Llama 3.2 3B)','gradio':'HF Space Adult_Novel','local':'локальный GPT-2','offline':'без модели'}[d.mode] || d.mode;
+  const src = {'model':'сгенерировано моделью','offline':'реплика персонажа (модель отдыхает)'}[d.source] || d.source;
+  const mode = {'dolphin':(window.modelName||'чат-модель Hugging Face'),'hf_api':'внешний API','gradio':'HF Space Adult_Novel','local':'локальный GPT-2','offline':'без модели'}[d.mode] || d.mode;
   return `${src} · ${mode} · ${(d.elapsed_ms/1000).toFixed(1)} с`;
 }
 
@@ -318,15 +319,33 @@ document.getElementById('btn-reset').addEventListener('click', async () => {
   startChat();
 });
 
+function applyStatus(st) {
+  const dot = document.getElementById('sdot'), txt = document.getElementById('stext');
+  const model = (st.loaded_model || st.base_model || 'модель').split('/').pop();
+  window.modelName = model;
+  if (st.engine_mode === 'dolphin') { dot.className='status-dot online'; txt.textContent=`онлайн · ${model} (локальная чат-модель, Hugging Face)`; return true; }
+  if (st.engine_mode === 'hf_api') { dot.className='status-dot online'; txt.textContent='онлайн · внешний chat-API'; return true; }
+  if (st.engine_mode === 'gradio') { dot.className='status-dot online'; txt.textContent='онлайн · HF Space pams90/Adult_Novel (GPT-2)'; return true; }
+  if (st.engine_mode === 'local') { dot.className='status-dot online'; txt.textContent='онлайн · локальная модель GPT-2'; return true; }
+  if (!st.engine_mode) { dot.className='status-dot'; txt.textContent='Эми загружает модель… (первый запуск может занять несколько минут — идёт скачивание весов)'; return false; }
+  dot.className='status-dot offline'; txt.textContent='оффлайн · ответы по каноничным репликам персонажа'; return true;
+}
+
+async function pollStatus() {
+  for (let i = 0; i < 120; i++) {          /* до ~10 минут фонового прогрева */
+    try {
+      const st = await api('/api/status');
+      if (applyStatus(st)) return;
+    } catch(_) {}
+    await new Promise(r => setTimeout(r, 5000));
+  }
+}
+
 (async function init(){
   try {
     const st = await api('/api/status');
-    const dot = document.getElementById('sdot'), txt = document.getElementById('stext');
     document.getElementById('sysprompt').textContent = st.system_prompt;
-    if (st.engine_mode === 'dolphin') { dot.className='status-dot online'; txt.textContent='онлайн · Dolphin 3.0 (Llama 3.2 3B, Hugging Face)'; }
-    else if (st.engine_mode === 'gradio') { dot.className='status-dot online'; txt.textContent='онлайн · HF Space pams90/Adult_Novel (GPT-2)'; }
-    else if (st.engine_mode === 'local') { dot.className='status-dot online'; txt.textContent='онлайн · локальная модель GPT-2'; }
-    else { dot.className='status-dot offline'; txt.textContent='оффлайн · ответы по заготовленным репликам'; }
+    if (!applyStatus(st)) pollStatus();     /* модель грузится — обновим статус сами */
   } catch(_) { document.getElementById('sysprompt').textContent='(не удалось получить статус)'; }
   await startChat().catch(()=>addMessage('assistant','Не удалось начать сессию. Обновите страницу.'));
 })();

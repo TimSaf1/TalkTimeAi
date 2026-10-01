@@ -94,10 +94,11 @@ def status():
         {
             "character": {"name": "Amy", "name_ru": "Эми", "age": 23,
                           "job": "менеджер отеля"},
-            "model_source": "https://huggingface.co/dphn/Dolphin3.0-Llama3.2-3B",
+            "model_source": "https://huggingface.co/" + DOLPHIN_ID,
             "base_model": DOLPHIN_ID,
             "fallback_space": "https://huggingface.co/spaces/pams90/Adult_Novel (gpt2)",
-            "engine_mode": eng.mode,          # dolphin | hf_api | gradio | local | offline
+            "engine_mode": eng.mode,          # None(грузится) | dolphin | hf_api | gradio | local | offline
+            "loaded_model": eng.loaded_model or DOLPHIN_ID,
             "external_api": bool(os.environ.get("AMY_API_URL")),
             "system_prompt": SYSTEM_PROMPT,
             "last_error": eng._last_error,
@@ -147,6 +148,18 @@ def chat():
     history = list(s["messages"])
     eng = get_engine()
     t0 = time.time()
+    if eng.mode is None:
+        # модель ещё грузится в фоне — честная временная реплика,
+        # чтобы чат не молчал; история при этом НЕ сохраняется в память Эми
+        return jsonify({
+            "session_id": sid,
+            "reply": "Я как раз подтягиваю «мозги» — первая загрузка модели "
+                     "идёт в фоне. Напиши мне через полминуты, и я отвечу уже "
+                     "по-настоящему! ☕",
+            "source": "warming",
+            "mode": "loading",
+            "elapsed_ms": int((time.time() - t0) * 1000),
+        })
     answer, source = eng.reply(message, history)
     s["messages"].append(("user", message))
     s["messages"].append(("assistant", answer))
@@ -184,5 +197,17 @@ def delete_history(sid):
 
 
 if __name__ == "__main__":
-    print("Amy is warming up… engine mode:", get_engine().mode)
+    # Прогрев движка в фоновом потоке: сервер стартует сразу, чат работает,
+    # а тяжёлая модель (скачивание ~7 ГБ + загрузка) подгружается параллельно.
+    import threading
+
+    def _warm():
+        try:
+            eng = get_engine()
+            print("Amy engine ready — mode:", eng.mode)
+        except Exception as e:  # noqa: BLE001
+            print("Engine warmup failed:", e)
+
+    threading.Thread(target=_warm, daemon=True).start()
+    print("Amy is warming up in background…")
     app.run(host="0.0.0.0", port=7860, debug=False)

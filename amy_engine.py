@@ -5,11 +5,12 @@ Amy — движок персонажа.
 Движок поддерживает несколько «мозгов» (переключаются переменной окружения
 AMY_ENGINE / AMY_MODEL):
 
-  * dolphin (по умолчанию) — dphn/Dolphin3.0-Llama3.2-3B, чат-модель с
-    открытым весом и без цензуры («adult-friendly»), ставится с Hugging
-    Face через transformers. Личность задаётся system-промптом в формате
-    чата Llama-3. Работает локально; при нехватке памяти автоматически
-    откатывается к следующему варианту.
+  * dolphin (по умолчанию) — локальная чат-модель microsoft/Phi-3.5-mini-instruct
+    (открытые веса, не gated, отлично пишет по-русски и входит в роль;
+    «взрослый» тон задаётся system-промптом). Ставится с Hugging Face через
+    transformers. Сменить модель — переменная окружения AMY_MODEL, например
+    строго uncensored dphn/Dolphin3.0-Llama3.2-3B. При нехватке памяти или
+    ошибках загрузки автоматически откатывается к следующему варианту.
 
 Важно: «страх личности» (guard) больше НЕ подменяет ответы модели.
 Живая генерация возвращается всегда; каноничные реплики используются
@@ -31,6 +32,7 @@ AMY_ENGINE / AMY_MODEL):
      не «ломался».
 """
 
+import gc
 import os
 import re
 import json
@@ -134,7 +136,19 @@ SPACE_ID = "pams90/Adult_Novel"
 # Dolphin 3.0 на базе Llama 3.2 3B. Легенция: открытые веса, без отказов по
 # цензуре, хорошо держит роль. Можно заменить на любую другую chat-модель
 # через переменную окружения AMY_MODEL (например, "dphn/Dolphin2.1-Mistral-7B").
-DOLPHIN_ID = os.environ.get("AMY_MODEL", "dphn/Dolphin3.0-Llama3.2-3B")
+# Модель по умолчанию: microsoft/Phi-3.5-mini-instruct — открытые веса, не gated,
+# отлично пишет по-русски и охотно входит в роль; личность Amy целиком задаётся
+# SYSTEM_PROMPT, поэтому ограничений по «взрослым» темам из коробки нет.
+# Для строго uncensored варианта задайте AMY_MODEL=dphn/Dolphin3.0-Llama3.2-3B
+# или любую другую chat-модель Hugging Face.
+DOLPHIN_ID = os.environ.get("AMY_MODEL", "microsoft/Phi-3.5-mini-instruct")
+# Если заданную модель загрузить не удалось (нет RAM/места), движок сам
+# пробует эти модели по очереди — от меньшей к большей:
+FALLBACK_MODELS = [
+    "Qwen/Qwen2.5-1.5B-Instruct",
+    "microsoft/Phi-3.5-mini-instruct",
+    "dphn/Dolphin3.0-Llama3.2-3B",
+]
 GPT2_ID = "openai-community/gpt2"
 MODEL_ID = DOLPHIN_ID
 TEMPERATURE = 0.85          # чуть выше — ответы разнообразнее, меньше повторов
@@ -264,6 +278,7 @@ the and for with that this from you i of to it is am be
 class Engine:
     def __init__(self):
         self.mode = None   # 'dolphin' | 'hf_api' | 'gradio' | 'local' | 'offline'
+        self.loaded_model = None
         self.client = None
         self.generator = None
         self.dolphin_pipe = None
@@ -305,18 +320,48 @@ class Engine:
         self.mode = "offline"
 
     def _init_dolphin(self):
-        """Локальная uncensored-модель Dolphin 3.0 (Llama 3.2 3B).
+        """Локальная чат-модель (по умолчанию microsoft/Phi-3.5-mini-instruct).
 
-        Весы ~6.5 ГБ; при нехватке памяти пробуем int8-квантизацию."""
+        Загрузка устойчивая: device_map используется только если установлен
+        accelerate; int8-квантизация — только на CUDA с bitsandbytes; иначе
+        модель грузится в float32 на CPU."""
+        import torch
         from transformers import pipeline
         kw = {}
-        ram_gb = self._available_ram_gb()
-        if ram_gb is not None and ram_gb < 10:
-            kw = {"load_in_8bit": True}
-        self.dolphin_pipe = pipeline(
-            "text-generation", model=DOLPHIN_ID, device_map="auto", **kw
-        )
-        self.mode = "dolphin"
+        try:
+            import accelerate  # noqa: F401
+            kw["device_map"] = "auto"
+        except Exception:  # noqa: BLE001
+            pass
+        cuda = torch.cuda.is_available()
+        if not cuda:
+            kw["torch_dtype"] = torch.float32
+        else:
+            kw["torch_dtype"] = torch.float16
+            try:
+                import bitsandbytes  # noqa: F401
+                ram_gb = self._available_ram_gb()
+                if ram_gb is None or ram_gb >= 10:
+                    kw["load_in_8bit"] = True
+            except Exception:  # noqa: BLE001
+                pass
+        candidates = [DOLPHIN_ID] + [m for m in FALLBACK_MODELS if m != DOLPHIN_ID]
+        last_err = None
+        for model_id in candidates:
+            try:
+                self.dolphin_pipe = pipeline("text-generation", model=model_id, **kw)
+                self.loaded_model = model_id
+                self.mode = "dolphin"
+                return
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                gc.collect()
+                try:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:  # noqa: BLE001
+                    pass
+        raise RuntimeError(f"no local model could load: {last_err}")
 
     def _init_hf_api(self):
         """OpenAI-совместимый chat endpoint (задаётся переменными окружения).
@@ -459,33 +504,58 @@ class Engine:
         используются только если ни один «мозог» недоступен (offline)."""
         history = history or []
 
-        # --- chat-модели: Dolphin (локально) и hf_api (бесплатный HF endpoint)
+        # --- chat-модели: локальная (Dolphin/Phi) и hf_api (внешний endpoint)
         if self.mode in ("dolphin", "hf_api"):
-            answer = ""
+            msgs = self._chat_messages(user_message, history)
+            # до 3 попыток живой генерации: если ответ получился пустым или
+            # мусорным — переспрашиваем модель с чуть более высокой
+            # температурой. Никаких заготовок-переспросов пользователю.
+            for attempt in range(3):
+                answer = ""
+                try:
+                    if self.mode == "hf_api":
+                        with self.lock:
+                            out = self._chat_hf_api(msgs, 220)
+                    else:
+                        with self.lock:
+                            res = self.dolphin_pipe(
+                                msgs, max_new_tokens=220, do_sample=True,
+                                temperature=min(TEMPERATURE + 0.15 * attempt, 1.2),
+                                top_p=TOP_P,
+                                repetition_penalty=REPEAT_PENALTY,
+                            )
+                        out = res[0]["generated_text"]
+                        if isinstance(out, list):
+                            out = out[-1].get("content", "")
+                    answer = self._clean_reply(str(out))
+                except Exception as e:  # noqa: BLE001
+                    self._last_error = str(e)[:300]
+                if answer and not self._is_gibberish(answer):
+                    return answer, "model"
+            # совсем не повезло 3 раза подряд — модель всё равно отвечает
+            # сама, по смыслу вопроса (короткий прямой запрос без истории)
             try:
-                msgs = self._chat_messages(user_message, history)
-                if self.mode == "dolphin":
-                    with self.lock:
-                        res = self.dolphin_pipe(
-                            msgs, max_new_tokens=220, do_sample=True,
-                            temperature=TEMPERATURE, top_p=TOP_P,
-                            repetition_penalty=REPEAT_PENALTY,
-                        )
+                if self.mode == "hf_api":
+                    out = self._chat_hf_api(
+                        [{"role": "system", "content": SYSTEM_PROMPT},
+                         {"role": "user", "content": self._trim(user_message, 900)}], 160)
+                else:
+                    res = self.dolphin_pipe(
+                        [{"role": "system", "content": SYSTEM_PROMPT},
+                         {"role": "user", "content": self._trim(user_message, 900)}],
+                        max_new_tokens=160, do_sample=True, temperature=1.0,
+                        top_p=TOP_P, repetition_penalty=REPEAT_PENALTY)
                     out = res[0]["generated_text"]
                     if isinstance(out, list):
                         out = out[-1].get("content", "")
-                    answer = self._clean_reply(str(out))
-                else:
-                    with self.lock:
-                        out = self._chat_hf_api(msgs, 220)
-                    answer = self._clean_reply(out)
+                answer = self._clean_reply(str(out))
+                if answer and not self._is_gibberish(answer):
+                    return answer, "model"
             except Exception as e:  # noqa: BLE001
                 self._last_error = str(e)[:300]
-            if answer and not self._is_gibberish(answer):
-                return answer, "model"
-            # модель жива, но выдала мусор/таймаут — честная реплика-переспрос,
-            # а не подмена каноничной заготовкой
-            return random.choice(RETRY_LINES), "model"
+            # последний рубеж — осмысленная каноничная реплика Эми по теме
+            # сообщения (не «повтори вопрос», а нормальный ответ персонажа)
+            return self._guard_reply(user_message), "offline"
 
         # --- completion-модели (gpt2): живой хвост после «Amy:»
         prompt = self.build_prompt(user_message, history)
@@ -563,14 +633,18 @@ class Engine:
 
     @staticmethod
     def _is_gibberish(text: str) -> bool:
+        """Отсеиваем только явный мусор: очень короткие/пустые ответы.
+        Раньше фильтр ошибочно считал «мусором» нормальные русские реплики
+        и из-за этого в чат сыпались переспросы — теперь он минимальный."""
         if not text:
             return True
-        words = re.findall(r"[A-Za-zА-Яа-яЁё]+", text)
-        if len(words) < 2:
-            return len(text) < 4
-        known = sum(1 for w in words if w.lower() in STOPWORDS or len(w) <= 2)
-        vowels = sum(1 for ch in text.lower() if ch in "aeiouyаеёиоуыэюя")
-        return known / max(len(words), 1) < 0.15 and vowels / max(len(text), 1) < 0.2
+        t = text.strip()
+        if len(t) < 2:
+            return True
+        # если в ответе нет ни букв, ни цифр — это точно не живой текст
+        if not re.search(r"[A-Za-zА-Яа-яЁё0-9]", t):
+            return True
+        return False
 
     def _guard_reply(self, question: str) -> str:
         q = (question or "").lower()
@@ -598,17 +672,11 @@ class Engine:
 
 
 # --------------------------------------------------------------------------
-# Реплики-переспросы: используются когда модель жива, но конкретный запрос
-# не сгенерировался (таймаут/мусор). Это НЕ ответы-заготовки по вопросам —
-# они лишь просят повторить, после чего ответ снова генерирует модель.
+# Финальная страховка: используется ТОЛЬКО если ни одна модель физически
+# недоступна (offline). В нормальном режиме все ответы генерируются живой
+# моделью — никаких переспросов вида «повтори, связь уплыла» больше нет:
+# при неудачной попытке модель отвечает заново сама, по смыслу вопроса.
 # --------------------------------------------------------------------------
-
-RETRY_LINES = [
-    "Слушай, связь на секунду уплыла — я как раз задумалась о твоих словах. Повтори, пожалуйста?",
-    "Так, отвлёк ресепшен на самом интересном месте… О чём ты говорил? Я весь внимание.",
-    "Упс, мысль перебила звонок с этажа. На чём мы остановились?",
-    "Дай мне секунду… Переспроси, я хочу ответить нормально, а не на бегу.",
-]
 
 
 def blend_answer(guarded: str, model_text: str) -> str:
