@@ -148,7 +148,7 @@
     <div class="badges">
       <span class="badge">23 года</span>
       <span class="badge">🏨 менеджер отеля</span>
-      <span class="badge">GPT-2</span>
+      <span class="badge">Dolphin 3.0</span>
     </div>
   </div>
 
@@ -167,9 +167,9 @@
     <div class="label">Движок</div>
     <div class="status-line"><span class="status-dot" id="sdot"></span><span id="stext">подключение к модели…</span></div>
     <div class="tech" style="margin-top:10px">
-      Модель: <b>openai-community/gpt2</b> (text-generation, T=0.8)<br/>
-      Источник: <a href="https://huggingface.co/spaces/pams90/Adult_Novel/tree/main" target="_blank">HF&nbsp;Space pams90/Adult_Novel</a><br/>
-      Подключение: Gradio API → fallback локальная модель → guard-реплики.
+      Модель: <b>dphn/Dolphin3.0-Llama3.2-3B</b> (uncensored chat, T=0.8)<br/>
+      Источник: <a href="https://huggingface.co/dphn/Dolphin3.0-Llama3.2-3B" target="_blank">HF&nbsp;dphn/Dolphin3.0-Llama3.2-3B</a><br/>
+      Fallback: <a href="https://huggingface.co/spaces/pams90/Adult_Novel/tree/main" target="_blank">HF&nbsp;Space pams90/Adult_Novel (GPT-2)</a> → локальная GPT-2 → guard-реплики.
     </div>
   </div>
 
@@ -199,7 +199,7 @@
       <textarea id="input" rows="1" placeholder="Написать Эми…"></textarea>
       <button class="send" id="send">Отправить</button>
     </div>
-    <div class="note">Пробный сайт. Ответы генерирует GPT-2 из HF Space «Adult Novel» — персонаж может иногда говорить сбивчиво; «страх личности» подменяет реплики вне образа.</div>
+    <div class="note">Пробный сайт. Ответы генерирует uncensored-модель Dolphin 3.0 (Llama 3.2 3B) с Hugging Face; «страх личности» подменяет реплики вне образа.</div>
   </footer>
 </main>
 
@@ -275,8 +275,8 @@ async function send() {
 }
 
 function sourceLabel(d) {
-  const src = {'model':'сгенерировано GPT-2','guard':'guard-личность','offline':'guard (модель недоступна)'}[d.source] || d.source;
-  const mode = {'gradio':'HF Space Adult_Novel','local':'локальный GPT-2','offline':'без модели'}[d.mode] || d.mode;
+  const src = {'model':'сгенерировано моделью','guard':'guard-личность','offline':'guard (модель недоступна)'}[d.source] || d.source;
+  const mode = {'dolphin':'Dolphin 3.0 (Llama 3.2 3B)','gradio':'HF Space Adult_Novel','local':'локальный GPT-2','offline':'без модели'}[d.mode] || d.mode;
   return `${src} · ${mode} · ${(d.elapsed_ms/1000).toFixed(1)} с`;
 }
 
@@ -315,7 +315,8 @@ document.getElementById('btn-reset').addEventListener('click', async () => {
     const st = await api('/api/status');
     const dot = document.getElementById('sdot'), txt = document.getElementById('stext');
     document.getElementById('sysprompt').textContent = st.system_prompt;
-    if (st.engine_mode === 'gradio') { dot.className='status-dot online'; txt.textContent='онлайн · HF Space pams90/Adult_Novel (GPT-2)'; }
+    if (st.engine_mode === 'dolphin') { dot.className='status-dot online'; txt.textContent='онлайн · Dolphin 3.0 (Llama 3.2 3B, Hugging Face)'; }
+    else if (st.engine_mode === 'gradio') { dot.className='status-dot online'; txt.textContent='онлайн · HF Space pams90/Adult_Novel (GPT-2)'; }
     else if (st.engine_mode === 'local') { dot.className='status-dot online'; txt.textContent='онлайн · локальная модель GPT-2'; }
     else { dot.className='status-dot offline'; txt.textContent='оффлайн · ответы по заготовленным репликам'; }
   } catch(_) { document.getElementById('sysprompt').textContent='(не удалось получить статус)'; }

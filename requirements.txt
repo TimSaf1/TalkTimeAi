@@ -1,5 +1,8 @@
 flask>=3.0
 gradio_client>=1.3
-# необязательно (fallback-режим локальной генерации, как в исходном space):
+# основной «мозг» — локальная uncensored chat-модель Dolphin 3.0 (Llama 3.2 3B):
 transformers>=4.40
 torch>=2.0
+accelerate>=0.30
+# опционально: авто-квантизация при нехватке RAM (<10 ГБ)
+bitsandbytes>=0.43; platform_machine == "x86_64"

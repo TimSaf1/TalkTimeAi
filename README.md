@@ -31,23 +31,33 @@ gh repo create amy-chat --public --source=. --push
 
 ## Откуда модель
 
-«Мозг» Эми — модель из Hugging Face Space
-**[pams90/Adult_Novel](https://huggingface.co/spaces/pams90/Adult_Novel/tree/main)**.
-В том space используется `openai-community/gpt2` через
-`transformers.pipeline("text-generation", ...)` с `do_sample=True,
-temperature=0.8`. Наш сайт вызывает ровно ту же модель и параметры:
+Основной «мозг» Эми — uncensored chat-модель с Hugging Face:
+**[dphn/Dolphin3.0-Llama3.2-3B](https://huggingface.co/dphn/Dolphin3.0-Llama3.2-3B)**
+(Llama 3.2 3B, дообученная на датасете Dolphin 3.0 без отказов по цензуре —
+поддерживает «взрослые» разговоры и хорошо держит роль). Модель скачивается
+и запускается локально через `transformers`.
 
-1. **gradio** — основной режим: запрос идёт в живой HF Space через
-   `gradio_client` (`Client("pams90/Adult_Novel").predict(prompt, max_length)`);
-2. **local** — fallback: если space недоступен, та же GPT-2 запускается
-   локально через `transformers`;
-3. **offline/guard** — если модели нет вовсе, отвечают каноничные реплики
+Порядок выбора движка (авто-fallback):
+
+1. **dolphin** — основной режим: локальная Dolphin 3.0; при нехватке RAM
+   (<10 ГБ) автоматически пробуется int8-квантизация (`bitsandbytes`);
+2. **gradio** — fallback: HF Space
+   [pams90/Adult_Novel](https://huggingface.co/spaces/pams90/Adult_Novel/tree/main)
+   (базовая `openai-community/gpt2`) через `gradio_client`;
+3. **local** — та же GPT-2 локально через `transformers`
+   (`do_sample=True, temperature=0.8`, как в исходном space);
+4. **offline/guard** — если моделей нет вовсе, отвечают каноничные реплики
    персонажа, чтобы диалог никогда не ломался.
+
+Переменные окружения: `AMY_MODEL` (id любой другой chat-модели на HF),
+`AMY_FORCE_MODE=dolphin|gradio|local|offline` (принудительный режим).
+
+Требования для основного режима: ~6.5 ГБ для весов (или ~4 ГБ в int8),
+первый запуск скачивает модель из Hugging Face.
 
 ## Как Эми «знает», кто она
 
-GPT-2 — базовая модель без инструкционного тюнинга, поэтому личность
-закрепляется тремя слоями (см. `amy_engine.py`):
+Личность закрепляется тремя слоями (см. `amy_engine.py`):
 
 * **системный промпт**: `You are Amy, a 23-year-old woman who works as a
   hotel manager…`;

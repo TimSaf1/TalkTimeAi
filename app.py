@@ -30,7 +30,7 @@ if _ENGINE_DIR and _ENGINE_DIR not in sys.path:
     sys.path.insert(0, _ENGINE_DIR)
 
 try:
-    from amy_engine import SYSTEM_PROMPT, get_engine
+    from amy_engine import SYSTEM_PROMPT, DOLPHIN_ID, get_engine
 except ModuleNotFoundError:
     sys.exit(
         "ОШИБКА: не найден файл amy_engine.py!\n"
@@ -83,9 +83,10 @@ def status():
         {
             "character": {"name": "Amy", "name_ru": "Эми", "age": 23,
                           "job": "менеджер отеля"},
-            "model_source": "https://huggingface.co/spaces/pams90/Adult_Novel",
-            "base_model": "openai-community/gpt2",
-            "engine_mode": eng.mode,          # gradio | local | offline
+            "model_source": "https://huggingface.co/dphn/Dolphin3.0-Llama3.2-3B",
+            "base_model": DOLPHIN_ID,
+            "fallback_space": "https://huggingface.co/spaces/pams90/Adult_Novel (gpt2)",
+            "engine_mode": eng.mode,          # dolphin | gradio | local | offline
             "system_prompt": SYSTEM_PROMPT,
             "last_error": eng._last_error,
         }

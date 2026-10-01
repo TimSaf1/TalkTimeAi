@@ -2,19 +2,26 @@
 """
 Amy — движок персонажа.
 
-Модель-«мозг» берётся из Hugging Face Space pams90/Adult_Novel:
-https://huggingface.co/spaces/pams90/Adult_Novel/tree/main
+Движок поддерживает несколько «мозгов» (переключаются переменной окружения
+AMY_ENGINE / AMY_MODEL):
 
-Тот space работает на базовой модели openai-community/gpt2 через
-`transformers.pipeline("text-generation", ...)` (см. app.py в space) с
-параметрами do_sample=True, temperature=0.8.  Мы используем ровно ту же
-модель и те же параметры — либо удалённо через Gradio API space
-(gradio_client), либо локально через transformers, если сети нет.
+  * dolphin (по умолчанию) — dphn/Dolphin3.0-Llama3.2-3B, чат-модель с
+    открытым weight и без цензуры («adult-friendly»), ставится с Hugging
+    Face через transformers. Личность задаётся system-промптом в формате
+    чата Llama-3. Работает локально; при нехватке памяти автоматически
+    откатывается к следующему варианту.
+  * gradio — удалённый HF Space pams90/Adult_Novel
+    (https://huggingface.co/spaces/pams90/Adult_Novel/tree/main),
+    базовая модель openai-community/gpt2 через Gradio Client.
+  * local — та же gpt2, но локально через transformers (как в исходном
+    space: do_sample=True, temperature=0.8).
+  * offline — ответы только из personality guard (работает всегда).
 
-GPT-2 — маленькая модель без инструкционного тюнинга, поэтому личность
-(имя Amy, 23 года, менеджер отеля) закрепляется двумя способами:
-  1. few-shot промпт в стиле романа (диалог User/Amy) — то, что GPT-2 умеет;
-  2. жёсткий «страх личности» (personality guard): ответы вне образа
+Личность (имя Amy, 23 года, менеджер отеля) закрепляется тремя способами:
+  1. system-промпт (для chat-моделей) / few-shot промпт в стиле романа
+     (для GPT-2);
+  2. контекст последних реплик диалога (краткосрочная память);
+  3. жёсткий «страх личности» (personality guard): ответы вне образа
      подменяются каноничными репликами Amy, чтобы персонаж никогда
      не «ломался».
 """
@@ -27,7 +34,13 @@ import random
 import threading
 
 SPACE_ID = "pams90/Adult_Novel"
-MODEL_ID = "openai-community/gpt2"
+# Модель по умолчанию — «взрослая» (uncensored) чат-модель с Hugging Face:
+# Dolphin 3.0 на базе Llama 3.2 3B. Легенция: открытые веса, без отказов по
+# цензуре, хорошо держит роль. Можно заменить на любую другую chat-модель
+# через переменную окружения AMY_MODEL (например, "dphn/Dolphin2.1-Mistral-7B").
+DOLPHIN_ID = os.environ.get("AMY_MODEL", "dphn/Dolphin3.0-Llama3.2-3B")
+GPT2_ID = "openai-community/gpt2"
+MODEL_ID = DOLPHIN_ID
 TEMPERATURE = 0.8
 
 # --------------------------------------------------------------------------
@@ -59,7 +72,7 @@ Amy: I work as a hotel manager. I check the rooms, greet guests, and make sure e
 User: {user_message}
 Amy:"""
 
-RU_HINT = "\n(Amy answers in Russian, in character.)"
+RU_HINT = "\n(Reply in natural Russian, staying in character as Amy. Keep it short and conversational.)"
 
 # Каноничные реплики — используются страховкой личности и как offline-режим.
 FACT_REPLIES = {
@@ -123,9 +136,10 @@ the and for with that this from you i of to it is am be
 
 class Engine:
     def __init__(self):
-        self.mode = None          # 'gradio' | 'local' | 'offline'
+        self.mode = None          # 'dolphin' | 'gradio' | 'local' | 'offline'
         self.client = None
         self.generator = None
+        self.dolphin_pipe = None
         self.lock = threading.Lock()
         self._last_error = ""
         self._connect()
@@ -135,7 +149,9 @@ class Engine:
         if os.environ.get("AMY_FORCE_MODE"):
             mode = os.environ["AMY_FORCE_MODE"]
             try:
-                if mode == "gradio":
+                if mode == "dolphin":
+                    self._init_dolphin()
+                elif mode == "gradio":
                     self._init_gradio()
                 elif mode == "local":
                     self._init_local()
@@ -144,20 +160,56 @@ class Engine:
                 return
             except Exception as e:  # noqa: BLE001
                 self._last_error = str(e)[:300]
-        # 1) удалённый Gradio space (как в исходном проекте)
+        # 1) локальная uncensored chat-модель Dolphin (основной «мозг»)
+        try:
+            self._init_dolphin()
+            return
+        except Exception as e:  # noqa: BLE001
+            self._last_error = f"dolphin: {e}"[:300]
+        # 2) удалённый Gradio space pams90/Adult_Novel (как в исходном проекте)
         try:
             self._init_gradio()
             return
         except Exception as e:  # noqa: BLE001
-            self._last_error = f"gradio: {e}"[:300]
-        # 2) локальный GPT-2 (та же модель, что использует space)
+            self._last_error += f" | gradio: {e}"[:300]
+        # 3) локальный GPT-2 (та же модель, что использует space)
         try:
             self._init_local()
             return
         except Exception as e:  # noqa: BLE001
             self._last_error += f" | local: {e}"[:300]
-        # 3) гарантированный ответ без сети
+        # 4) гарантированный ответ без сети
         self.mode = "offline"
+
+    def _init_dolphin(self):
+        """Локальная uncensored-модель Dolphin 3.0 (Llama 3.2 3B).
+
+        Весы ~6.5 ГБ; при нехватке памяти пробуем int8-квантизацию,
+        затем — более лёгкую gpt2, а если и это неудачно — offline."""
+        from transformers import pipeline
+        kw = {}
+        ram_gb = self._available_ram_gb()
+        if ram_gb is not None and ram_gb < 10:
+            kw = {"load_in_8bit": True}
+        self.dolphin_pipe = pipeline(
+            "text-generation", model=DOLPHIN_ID, device_map="auto", **kw
+        )
+        self.mode = "dolphin"
+
+    @staticmethod
+    def _available_ram_gb():
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) / 1024 / 1024
+        except OSError:
+            pass
+        try:
+            import psutil  # необязательная зависимость
+            return psutil.virtual_memory().available / 1024 ** 3
+        except Exception:  # noqa: BLE001
+            return None
 
     def _init_gradio(self):
         from gradio_client import Client  # импорт только при попытке
@@ -169,11 +221,20 @@ class Engine:
 
     def _init_local(self):
         from transformers import pipeline
-        self.generator = pipeline("text-generation", model=MODEL_ID)
+        self.generator = pipeline("text-generation", model=GPT2_ID)
         self.mode = "local"
 
     # -- низкоуровневая генерация ------------------------------------------
     def raw_generate(self, prompt: str, max_length: int) -> str:
+        if self.mode == "dolphin":
+            res = self.dolphin_pipe(
+                [{"role": "user", "content": prompt}],
+                max_new_tokens=min(max_length, 256),
+                do_sample=True,
+                temperature=TEMPERATURE,
+                top_p=0.9,
+            )
+            return res[0]["generated_text"][-1]["content"]
         if self.mode == "gradio":
             out = self.client.predict(prompt, float(max_length), api_name="/predict")
             return str(out)
@@ -202,8 +263,42 @@ class Engine:
             prompt += RU_HINT
         return prompt
 
+    def _reply_dolphin(self, user_message: str, history):
+        """Прямой чат с Dolphin: system-промпт + последние 10 реплик истории."""
+        msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+        for role, text in history[-10:]:
+            msgs.append({"role": "user" if role == "user" else "assistant",
+                         "content": self._trim(text, 700)})
+        content = self._trim(user_message, 900)
+        if self._looks_russian(user_message) or any(
+            self._looks_russian(t) for _, t in history[-6:]
+        ):
+            content += RU_HINT
+        msgs.append({"role": "user", "content": content})
+        answer = ""
+        try:
+            with self.lock:
+                res = self.dolphin_pipe(
+                    msgs, max_new_tokens=256, do_sample=True,
+                    temperature=TEMPERATURE, top_p=0.9,
+                )
+            out = res[0]["generated_text"]
+            if isinstance(out, list):
+                out = out[-1].get("content", "")
+            answer = self._clean(str(out))
+        except Exception as e:  # noqa: BLE001
+            self._last_error = str(e)[:300]
+        guarded = self._guard_reply(user_message)
+        if not self._in_character(answer, user_message):
+            return blend_answer(guarded, answer), "guard"
+        return answer, "model"
+
     def reply(self, user_message: str, history=None):
         """Возвращает (текст_ответа, источник: 'model'|'guard'|'offline')."""
+        # Dolphin — настоящая chat-модель: отправляем system + историю как есть.
+        if self.mode == "dolphin":
+            return self._reply_dolphin(user_message, history or [])
+
         prompt = self.build_prompt(user_message, history or [])
 
         # HF Space «Adult Novel» работает на бесплатном CPU-железе и падает
@@ -340,14 +435,16 @@ class Engine:
 # --------------------------------------------------------------------------
 
 def blend_answer(guarded: str, model_text: str) -> str:
+    """Возвращает ответ модели в чистом виде; guarded-реплика — как страховка,
+    если генерация не удалась или выдала мусор. Никаких вставок вида
+    «…кстати, модель добавила:» больше нет."""
     if not model_text:
         return guarded
-    t = model_text.strip()
-    # берём только первую фразу модельного хвоста, если она короткая и чистая
-    first = re.split(r"(?<=[.!?]) ", t)[0]
-    if 8 <= len(first) <= 90 and not re.search(r"email|chapter|novel|writer", first, re.I):
-        return f"{guarded} …кстати, модель добавила: «{first}»"
-    return guarded
+    t = " ".join(model_text.split())
+    # если модельный текст слишком короткий или содержит явный мусор — берём guarded
+    if len(t) < 3 or re.search(r"email|chapter|novel writer", t, re.I):
+        return guarded
+    return t
 
 
 ENGINE = None
