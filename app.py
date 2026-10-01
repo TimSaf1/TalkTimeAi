@@ -42,7 +42,14 @@ except ModuleNotFoundError:
 
 from flask import Flask, jsonify, request, send_from_directory
 
-app = Flask(__name__, static_folder="static")
+# Папка static ищетcя рядом с app.py (или в cwd), а не относительно места запуска,
+# иначе при запуске из другой папки GET / вернёт 404.
+_STATIC_DIR = next(
+    (d for d in (os.path.join(_HERE, "static"), os.path.join(os.getcwd(), "static"))
+     if os.path.isdir(d)),
+    os.path.join(_HERE, "static"),
+)
+app = Flask(__name__, static_folder=_STATIC_DIR, static_url_path="/static")
 
 GREETING = (
     "Привет! Я Эми — мне 23 года, и я менеджер этого отеля. "
@@ -60,7 +67,13 @@ def add_headers(resp):
 
 @app.get("/")
 def index():
-    return send_from_directory("static", "index.html")
+    return send_from_directory(_STATIC_DIR, "index.html")
+
+
+@app.get("/favicon.ico")
+def favicon():
+    # тихая заглушка, чтобы не спамить 404 в логах
+    return "", 204
 
 
 @app.get("/api/status")
