@@ -71,6 +71,11 @@
     transition: .15s;
   }
   button.reset:hover { border-color: var(--accent); color: var(--text); }
+  button.danger { background: rgba(248,113,113,.08); border: 1px solid rgba(248,113,113,.35);
+    color: #fca5a5; }
+  button.danger:hover { border-color: #f87171; color: #fecaca; background: rgba(248,113,113,.16); }
+  .side-btns { display:flex; flex-direction:column; gap:8px; margin-top:auto; }
+  .confirm { border-color: #f87171 !important; color: #fecaca !important; font-weight:600; }
 
   /* ---------- чат ---------- */
   main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
@@ -173,7 +178,10 @@
     </div>
   </div>
 
-  <button class="reset" id="btn-reset">↻ Начать диалог заново</button>
+  <div class="side-btns">
+    <button class="reset" id="btn-reset">↻ Начать диалог заново</button>
+    <button class="reset danger" id="btn-clear" title="Удалить всю переписку с Эми из памяти сервера">🗑 Очистить переписку (удалить из памяти)</button>
+  </div>
 </aside>
 
 <main>

@@ -30,7 +30,7 @@ if _ENGINE_DIR and _ENGINE_DIR not in sys.path:
     sys.path.insert(0, _ENGINE_DIR)
 
 try:
-    from amy_engine import SYSTEM_PROMPT, DOLPHIN_ID, get_engine
+    from amy_engine import SYSTEM_PROMPT, DOLPHIN_ID, STORE, get_engine
 except ModuleNotFoundError:
     sys.exit(
         "ОШИБКА: не найден файл amy_engine.py!\n"
@@ -56,7 +56,18 @@ GREETING = (
     "Устроимся поудобнее? Расскажи, как прошёл твой день."
 )
 
-sessions = {}  # id -> {"messages": [(role, text)], "created": ts}
+sessions = {}  # id -> {"messages": [(role, text)], "created": ts}  (кэш поверх SQLite)
+
+
+def _session(sid):
+    """Возвращает кэшированную сессию; при промахе загружает историю из БД."""
+    s = sessions.get(sid)
+    if s is None:
+        hist = STORE.history(sid)
+        if hist:
+            s = {"messages": hist, "created": time.time()}
+            sessions[sid] = s
+    return s
 
 
 @app.after_request
@@ -86,24 +97,34 @@ def status():
             "model_source": "https://huggingface.co/dphn/Dolphin3.0-Llama3.2-3B",
             "base_model": DOLPHIN_ID,
             "fallback_space": "https://huggingface.co/spaces/pams90/Adult_Novel (gpt2)",
-            "engine_mode": eng.mode,          # dolphin | gradio | local | offline
+            "engine_mode": eng.mode,          # dolphin | hf_api | gradio | local | offline
+            "external_api": bool(os.environ.get("AMY_API_URL")),
             "system_prompt": SYSTEM_PROMPT,
             "last_error": eng._last_error,
+            "storage": "sqlite:" + os.path.basename(STORE.path),
         }
     )
 
 
 @app.post("/api/session/start")
 def start_session():
+    data = request.get_json(silent=True) or {}
+    sid = data.get("session_id")
+    # если клиент прислал старый id и в БД есть переписка — продолжаем её
+    if sid and STORE.count(sid):
+        s = _session(sid)
+        return jsonify({"session_id": sid, "resumed": True,
+                        "messages": [{"role": r, "text": t} for r, t in s["messages"]]})
     sid = uuid.uuid4().hex[:12]
+    STORE.create(sid, GREETING)
     sessions[sid] = {"messages": [("assistant", GREETING)], "created": time.time()}
-    return jsonify({"session_id": sid,
+    return jsonify({"session_id": sid, "resumed": False,
                     "messages": [{"role": "assistant", "text": GREETING}]})
 
 
 @app.get("/api/history/<sid>")
 def history(sid):
-    s = sessions.get(sid)
+    s = _session(sid)
     if not s:
         return jsonify({"error": "session not found"}), 404
     return jsonify({"messages": [{"role": r, "text": t} for r, t in s["messages"]]})
@@ -116,24 +137,28 @@ def chat():
     sid = data.get("session_id")
     if not message:
         return jsonify({"error": "empty message"}), 400
-    if sid not in sessions:
+    s = _session(sid) if sid else None
+    if s is None:
         sid = uuid.uuid4().hex[:12]
-        sessions[sid] = {"messages": [("assistant", GREETING)], "created": time.time()}
+        STORE.create(sid, GREETING)
+        s = {"messages": [("assistant", GREETING)], "created": time.time()}
+        sessions[sid] = s
 
-    s = sessions[sid]
     history = list(s["messages"])
     eng = get_engine()
     t0 = time.time()
     answer, source = eng.reply(message, history)
     s["messages"].append(("user", message))
     s["messages"].append(("assistant", answer))
-    # история чата ограничена, но память модели берёт последние 4 реплики
+    STORE.add(sid, "user", message)
+    STORE.add(sid, "assistant", answer)
+    # история чата ограничена со стороны модели, но память (БД) полная
     if len(s["messages"]) > 60:
         s["messages"] = s["messages"][-60:]
     return jsonify({
         "session_id": sid,
         "reply": answer,
-        "source": source,               # model | guard | offline
+        "source": source,               # model | offline
         "mode": eng.mode,
         "elapsed_ms": int((time.time() - t0) * 1000),
     })
@@ -141,10 +166,21 @@ def chat():
 
 @app.post("/api/reset")
 def reset():
+    """Начать диалог заново: та же сессия, история очищена."""
     sid = (request.get_json(silent=True) or {}).get("session_id")
-    if sid in sessions:
+    if sid:
+        STORE.clear(sid)
+        STORE.create(sid, GREETING)
         sessions[sid] = {"messages": [("assistant", GREETING)], "created": time.time()}
     return jsonify({"ok": True, "messages": [{"role": "assistant", "text": GREETING}]})
+
+
+@app.delete("/api/history/<sid>")
+def delete_history(sid):
+    """Полное удаление переписки из памяти (SQLite + кэш)."""
+    STORE.clear(sid)
+    sessions.pop(sid, None)
+    return jsonify({"ok": True, "deleted": sid})
 
 
 if __name__ == "__main__":

@@ -1,0 +1,11 @@
+nohup: ignoring input
+Amy is warming up… engine mode: offline
+ * Serving Flask app 'app'
+ * Debug mode: off
+WARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:7860
+ * Running on http://21.0.3.241:7860
+Press CTRL+C to quit
+127.0.0.1 - - [01/Oct/2026 19:04:15] "GET /api/status HTTP/1.1" 200 -
+127.0.0.1 - - [01/Oct/2026 19:04:20] "GET / HTTP/1.1" 200 -
