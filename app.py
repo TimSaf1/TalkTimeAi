@@ -30,6 +30,7 @@ if _ENGINE_DIR and _ENGINE_DIR not in sys.path:
     sys.path.insert(0, _ENGINE_DIR)
 
 try:
+    import amy_engine
     from amy_engine import SYSTEM_PROMPT, DOLPHIN_ID, STORE, get_engine
 except ModuleNotFoundError:
     sys.exit(
@@ -98,6 +99,8 @@ def status():
             "base_model": DOLPHIN_ID,
             "fallback_space": "https://huggingface.co/spaces/pams90/Adult_Novel (gpt2)",
             "engine_mode": eng.mode,          # None(грузится) | dolphin | hf_api | gradio | local | offline
+            "turbo": amy_engine.FAST_MODE,    # режим Turbo (ускоренная генерация)
+            "max_tokens": amy_engine.MAX_TOKENS,
             "loaded_model": eng.loaded_model or DOLPHIN_ID,
             "external_api": bool(os.environ.get("AMY_API_URL")),
             "system_prompt": SYSTEM_PROMPT,

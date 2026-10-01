@@ -149,11 +149,25 @@ FALLBACK_MODELS = [
     "microsoft/Phi-3.5-mini-instruct",
     "dphn/Dolphin3.0-Llama3.2-3B",
 ]
+# GGUF-версии тех же моделей для слабых ПК без GPU: (id репо, имя файла кванта)
+_GGUF_ALTERNATIVES = {
+    "Qwen/Qwen2.5-1.5B-Instruct": ("unsloth/Qwen2.5-1.5B-Instruct-GGUF", "Q4_K_M.gguf"),
+    "microsoft/Phi-3.5-mini-instruct": ("bartowski/Phi-3.5-mini-instruct-GGUF", "Q4_K_M.gguf"),
+    "dphn/Dolphin3.0-Llama3.2-3B": ("unsloth/Llama-3.2-3B-Instruct-GGUF", "Q4_K_M.gguf"),
+}
 GPT2_ID = "openai-community/gpt2"
 MODEL_ID = DOLPHIN_ID
 TEMPERATURE = 0.85          # чуть выше — ответы разнообразнее, меньше повторов
 TOP_P = 0.92
 REPEAT_PENALTY = 1.15       # защита от «заезженных» фраз
+
+# --- Режим Turbo (ускорение генерации) -------------------------------------
+# По умолчанию включён: на CPU большая модель отвечает очень долго, поэтому
+# Turbo режет длину ответа и историю чата до разумного минимума. Отключить:
+#   set AMY_FAST=0   (Windows)  /  export AMY_FAST=0  (Linux/macOS)
+FAST_MODE = os.environ.get("AMY_FAST", "1") != "0"
+MAX_TOKENS = 96 if FAST_MODE else 220     # длина ответа модели
+HISTORY_TURNS = 4 if FAST_MODE else 16    # сколько реплик памяти отправляем
 
 # Опциональный OpenAI-совместимый API (любой провайдер: HF Inference,
 # OpenRouter, Together, Groq, локальный Ollama…). Задайте две переменные
@@ -322,9 +336,12 @@ class Engine:
     def _init_dolphin(self):
         """Локальная чат-модель (по умолчанию microsoft/Phi-3.5-mini-instruct).
 
-        Загрузка устойчивая: device_map используется только если установлен
-        accelerate; int8-квантизация — только на CUDA с bitsandbytes; иначе
-        модель грузится в float32 на CPU."""
+        Turbo-режим (AMY_FAST=1, по умолчанию) сильно ускоряет ответы:
+        - на CUDA с bitsandbytes модель грузится в 4-bit квантовании
+          (~2.5 ГБ VRAM вместо ~7 ГБ, генерация заметно быстрее);
+        - на CPU выбирается минимальная из доступных моделей и используется
+          float16/bfloat16 вместо float32 (в 2 раза меньше памяти и быстрее).
+        Отключить ускорение: set AMY_FAST=0."""
         import torch
         from transformers import pipeline
         kw = {}
@@ -333,23 +350,76 @@ class Engine:
             kw["device_map"] = "auto"
         except Exception:  # noqa: BLE001
             pass
+        # Защита от OOM: на CPU большая модель float32/bf16 занимает в памяти
+        # примерно 2x размер весов + KV-кэш; при нехватке RAM процесс просто
+        # убивается системой (Killed). Пороги подбираются по размеру модели.
+        ram_gb = self._available_ram_gb()
         cuda = torch.cuda.is_available()
-        if not cuda:
-            kw["torch_dtype"] = torch.float32
-        else:
+        if cuda:
             kw["torch_dtype"] = torch.float16
             try:
                 import bitsandbytes  # noqa: F401
                 ram_gb = self._available_ram_gb()
-                if ram_gb is None or ram_gb >= 10:
+                if FAST_MODE:
+                    # 4-bit — самый быстрый вариант на GPU
+                    kw["load_in_4bit"] = True
+                    kw["bnb_4bit_compute_dtype"] = torch.float16
+                elif ram_gb is None or ram_gb >= 10:
                     kw["load_in_8bit"] = True
             except Exception:  # noqa: BLE001
                 pass
-        candidates = [DOLPHIN_ID] + [m for m in FALLBACK_MODELS if m != DOLPHIN_ID]
-        last_err = None
-        for model_id in candidates:
+        else:
+            # CPU: float32 слишком медленный для больших моделей;
+            # bfloat16 поддерживается современными x86 (AVX) и Apple Silicon
             try:
-                self.dolphin_pipe = pipeline("text-generation", model=model_id, **kw)
+                bf16_ok = torch.cpu_supports_bfloat16()
+            except AttributeError:
+                import platform
+                machine = platform.machine().lower()
+                bf16_ok = machine in ("arm64", "aarch64") or self._cpu_has_avx()
+            kw["torch_dtype"] = torch.bfloat16 if (FAST_MODE and bf16_ok) \
+                else torch.float32
+        candidates = [DOLPHIN_ID] + [m for m in FALLBACK_MODELS if m != DOLPHIN_ID]
+        if FAST_MODE and not cuda:
+            # на CPU без GPU берём самую лёгкую живую модель: маленькая
+            # Qwen отвечает в разы быстрее и при этом остаётся связной
+            candidates.sort(key=lambda m: {
+                "Qwen/Qwen2.5-1.5B-Instruct": 0,
+                "microsoft/Phi-3.5-mini-instruct": 1,
+                "dphn/Dolphin3.0-Llama3.2-3B": 2,
+            }.get(m, 3))
+            # если свободной памяти мало (<4 ГБ) — большая модель просто убьёт
+            # процесс нехваткой RAM; сразу пробуем самую крошечную болталку
+            if ram_gb is not None and ram_gb < 4:
+                candidates.insert(0, "princeton-nlp/Sheared-LLaMA-1.3B")
+        # Приблизительный объём RAM, нужный каждой модели на CPU
+        # (веса bf16/fp32 + KV-кэш + оверхед), в ГБ:
+        ram_need = {
+            "Qwen/Qwen2.5-1.5B-Instruct": 8,
+            "microsoft/Phi-3.5-mini-instruct": 10,
+            "dphn/Dolphin3.0-Llama3.2-3B": 10,
+            "princeton-nlp/Sheared-LLaMA-1.3B": 6,
+        }
+        last_err = None
+        tried = set()
+        for model_id in list(candidates):
+            if not cuda and ram_gb is not None \
+                    and ram_gb < ram_need.get(model_id, 9):
+                # эта модель гарантированно не влезет — вместо неё пробуем
+                # GGUF-квант Q4 той же семьи (~1-2 ГБ RAM)
+                q = _GGUF_ALTERNATIVES.get(model_id)
+                if q and q[0] not in tried:
+                    tried.add(q[0])
+                    candidates.append(q[0])
+                continue
+            try:
+                pipe_kw = dict(kw)
+                fname = _GGUF_ALTERNATIVES.get(model_id, (None,))[1] \
+                    if model_id in _GGUF_ALTERNATIVES else None
+                if fname:
+                    pipe_kw["model_basename"] = fname
+                self.dolphin_pipe = pipeline("text-generation", model=model_id,
+                                             **pipe_kw)
                 self.loaded_model = model_id
                 self.mode = "dolphin"
                 return
@@ -391,6 +461,25 @@ class Engine:
         if not body.get("choices"):
             raise RuntimeError("empty completion")
         self.mode = "hf_api"
+
+    @staticmethod
+    def _cpu_has_avx():
+        """Есть ли у процессора AVX (нужен для быстрой bfloat16-генерации)."""
+        try:
+            with open("/proc/cpuinfo") as f:
+                return "avx" in f.read().lower()
+        except OSError:
+            pass
+        try:  # Windows: современные x86-процессоры (2013+) почти всегда с AVX
+            import platform
+            machine = platform.machine().lower()
+            if machine in ("amd64", "x86_64"):
+                return True
+            if machine in ("arm64", "aarch64"):  # Apple Silicon / Windows ARM
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        return False
 
     @staticmethod
     def _available_ram_gb():
@@ -452,7 +541,7 @@ class Engine:
         payload = _json.dumps({
             "model": HF_API_MODEL,
             "messages": messages,
-            "max_tokens": min(int(max_new_tokens), 300),
+            "max_tokens": min(int(max_new_tokens), 300 if not FAST_MODE else 128),
             "temperature": TEMPERATURE,
             "top_p": TOP_P,
             "repetition_penalty": REPEAT_PENALTY,
@@ -486,10 +575,10 @@ class Engine:
     def _chat_messages(self, user_message: str, history):
         """Сообщения для chat-моделей: system-личность + полная история чата."""
         msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
-        for role, text in history[-16:]:
+        for role, text in history[-HISTORY_TURNS:]:
             msgs.append({"role": "user" if role == "user" else "assistant",
                          "content": self._trim(text, 700)})
-        content = self._trim(user_message, 900)
+        content = self._trim(user_message, 900 if not FAST_MODE else 500)
         if self._looks_russian(user_message) or any(
             self._looks_russian(t) for _, t in history[-6:]
         ):
@@ -510,16 +599,17 @@ class Engine:
             # до 3 попыток живой генерации: если ответ получился пустым или
             # мусорным — переспрашиваем модель с чуть более высокой
             # температурой. Никаких заготовок-переспросов пользователю.
-            for attempt in range(3):
+            max_attempts = 1 if FAST_MODE else 3
+            for attempt in range(max_attempts):
                 answer = ""
                 try:
                     if self.mode == "hf_api":
                         with self.lock:
-                            out = self._chat_hf_api(msgs, 220)
+                            out = self._chat_hf_api(msgs, MAX_TOKENS)
                     else:
                         with self.lock:
                             res = self.dolphin_pipe(
-                                msgs, max_new_tokens=220, do_sample=True,
+                                msgs, max_new_tokens=MAX_TOKENS, do_sample=True,
                                 temperature=min(TEMPERATURE + 0.15 * attempt, 1.2),
                                 top_p=TOP_P,
                                 repetition_penalty=REPEAT_PENALTY,

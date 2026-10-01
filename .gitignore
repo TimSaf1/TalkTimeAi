@@ -1,8 +1,6 @@
-# Compiled and cache files
 __pycache__/
 *.pyc
-
-# Database files
 amy_chats.db
 amy_chats.db-shm
 amy_chats.db-wal
+.env
