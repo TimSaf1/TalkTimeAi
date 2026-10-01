@@ -1,0 +1,113 @@
+# -*- coding: utf-8 -*-
+"""
+Amy — пробный сайт-переписка с нейросетью в стиле Character.ai.
+
+«Мозг» персонажа — модель из Hugging Face Space pams90/Adult_Novel
+(openai-community/gpt2, text-generation), подключается через Gradio API.
+Личность (Эми, 23 года, менеджер отеля) задаётся системным промптом,
+few-shot диалогом и «страхом личности».
+
+Запуск:  python3 app.py   ->  http://localhost:7860
+"""
+
+import time
+import uuid
+
+from flask import Flask, jsonify, request, send_from_directory
+
+from amy_engine import SYSTEM_PROMPT, get_engine
+
+app = Flask(__name__, static_folder="static")
+
+GREETING = (
+    "Привет! Я Эми — мне 23 года, и я менеджер этого отеля. "
+    "Устроимся поудобнее? Расскажи, как прошёл твой день."
+)
+
+sessions = {}  # id -> {"messages": [(role, text)], "created": ts}
+
+
+@app.after_request
+def add_headers(resp):
+    resp.headers.setdefault("Cache-Control", "no-store")
+    return resp
+
+
+@app.get("/")
+def index():
+    return send_from_directory("static", "index.html")
+
+
+@app.get("/api/status")
+def status():
+    eng = get_engine()
+    return jsonify(
+        {
+            "character": {"name": "Amy", "name_ru": "Эми", "age": 23,
+                          "job": "менеджер отеля"},
+            "model_source": "https://huggingface.co/spaces/pams90/Adult_Novel",
+            "base_model": "openai-community/gpt2",
+            "engine_mode": eng.mode,          # gradio | local | offline
+            "system_prompt": SYSTEM_PROMPT,
+            "last_error": eng._last_error,
+        }
+    )
+
+
+@app.post("/api/session/start")
+def start_session():
+    sid = uuid.uuid4().hex[:12]
+    sessions[sid] = {"messages": [("assistant", GREETING)], "created": time.time()}
+    return jsonify({"session_id": sid,
+                    "messages": [{"role": "assistant", "text": GREETING}]})
+
+
+@app.get("/api/history/<sid>")
+def history(sid):
+    s = sessions.get(sid)
+    if not s:
+        return jsonify({"error": "session not found"}), 404
+    return jsonify({"messages": [{"role": r, "text": t} for r, t in s["messages"]]})
+
+
+@app.post("/api/chat")
+def chat():
+    data = request.get_json(silent=True) or {}
+    message = (data.get("message") or "").strip()
+    sid = data.get("session_id")
+    if not message:
+        return jsonify({"error": "empty message"}), 400
+    if sid not in sessions:
+        sid = uuid.uuid4().hex[:12]
+        sessions[sid] = {"messages": [("assistant", GREETING)], "created": time.time()}
+
+    s = sessions[sid]
+    history = list(s["messages"])
+    eng = get_engine()
+    t0 = time.time()
+    answer, source = eng.reply(message, history)
+    s["messages"].append(("user", message))
+    s["messages"].append(("assistant", answer))
+    # история чата ограничена, но память модели берёт последние 4 реплики
+    if len(s["messages"]) > 60:
+        s["messages"] = s["messages"][-60:]
+    return jsonify({
+        "session_id": sid,
+        "reply": answer,
+        "source": source,               # model | guard | offline
+        "mode": eng.mode,
+        "elapsed_ms": int((time.time() - t0) * 1000),
+    })
+
+
+@app.post("/api/reset")
+def reset():
+    sid = (request.get_json(silent=True) or {}).get("session_id")
+    if sid in sessions:
+        sessions[sid] = {"messages": [("assistant", GREETING)], "created": time.time()}
+    return jsonify({"ok": True, "messages": [{"role": "assistant", "text": GREETING}]})
+
+
+if __name__ == "__main__":
+    print("Amy is warming up… engine mode:", get_engine().mode)
+    app.run(host="0.0.0.0", port=7860, debug=False)
