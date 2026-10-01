@@ -10,12 +10,37 @@ few-shot диалогом и «страхом личности».
 Запуск:  python3 app.py   ->  http://localhost:7860
 """
 
+import os
+import sys
 import time
 import uuid
 
-from flask import Flask, jsonify, request, send_from_directory
+# Запуск из любой папки: ищем amy_engine.py рядом со скриптом,
+# в текущей директории или в ./src — и добавляем найденную папку в sys.path.
+_HERE = os.path.dirname(os.path.abspath(__file__))
 
-from amy_engine import SYSTEM_PROMPT, get_engine
+def _find_engine_dir():
+    for d in (_HERE, os.getcwd(), os.path.join(_HERE, "src")):
+        if os.path.isfile(os.path.join(d, "amy_engine.py")):
+            return d
+    return None
+
+_ENGINE_DIR = _find_engine_dir()
+if _ENGINE_DIR and _ENGINE_DIR not in sys.path:
+    sys.path.insert(0, _ENGINE_DIR)
+
+try:
+    from amy_engine import SYSTEM_PROMPT, get_engine
+except ModuleNotFoundError:
+    sys.exit(
+        "ОШИБКА: не найден файл amy_engine.py!\n"
+        "Он должен лежать в одной папке с app.py.\n"
+        f"Искали в: {_HERE} | {os.getcwd()}\n"
+        "Решение: скачайте ВСЕ файлы репозитория (Code -> Download ZIP)\n"
+        "или клонируйте:  git clone https://github.com/TimSaf1/TalkTimeAi.git"
+    )
+
+from flask import Flask, jsonify, request, send_from_directory
 
 app = Flask(__name__, static_folder="static")
 
